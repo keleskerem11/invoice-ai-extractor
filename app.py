@@ -21,11 +21,19 @@ from mistralai import Mistral
 
 # ---------- CONFIGURATION ----------
 
+# Charge la clé API depuis .env (local) ou st.secrets (Streamlit Cloud)
 load_dotenv()
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 
+# Fallback vers st.secrets pour le déploiement Streamlit Cloud
 if not MISTRAL_API_KEY:
-    st.error("⚠️ Clé API Mistral introuvable. Vérifie ton fichier .env")
+    try:
+        MISTRAL_API_KEY = st.secrets["MISTRAL_API_KEY"]
+    except (KeyError, FileNotFoundError):
+        pass
+
+if not MISTRAL_API_KEY:
+    st.error("⚠️ Clé API Mistral introuvable. Configure-la dans .env ou dans les Secrets Streamlit.")
     st.stop()
 
 client = Mistral(api_key=MISTRAL_API_KEY)
