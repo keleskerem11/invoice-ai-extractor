@@ -1,0 +1,6 @@
+streamlit
+mistralai==1.5.0
+pymupdf
+pandas
+openpyxl
+python-dotenv
