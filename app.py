@@ -1,10 +1,18 @@
 """
-Invoice AI Extractor v2
+Invoice AI Extractor v3
 =======================
 App Streamlit qui extrait automatiquement les données de factures PDF
 via l'API Mistral AI (modèle Pixtral, multimodal).
 
 Modes : Single (1 facture en détail) ou Batch (plusieurs factures consolidées).
+
+v3 changelog :
+- Split SYSTEM_PROMPT / EXTRACTION_PROMPT (séparation rôle/tâche)
+- Ajout d'un few-shot example complet (facture BTP avec acompte + multi-TVA)
+- Structure XML du prompt (<schema>, <rules>, <example>, <verification_finale>)
+- temperature=0 pour résultats déterministes
+- Types harmonisés dans le schéma
+- Section de vérification comptable (HT+TVA=TTC, TTC-acomptes=net à payer)
 
 Auteur : Kerem Keles
 """
@@ -38,119 +46,214 @@ if not MISTRAL_API_KEY:
 
 client = Mistral(api_key=MISTRAL_API_KEY)
 
-# ---------- PROMPT D'EXTRACTION ----------
 
-EXTRACTION_PROMPT = """Tu es un expert en extraction de données de factures.
+# ---------- PROMPTS D'EXTRACTION ----------
 
-Analyse cette facture (qui peut être sur plusieurs pages) et extrait TOUTES les informations dans un format JSON STRICT.
+SYSTEM_PROMPT = """Tu es un expert-comptable spécialisé dans l'extraction de données de factures françaises et européennes.
 
-⚠️ ATTENTION : tu dois capturer TOUS les éléments financiers de la facture, sans en oublier un seul.
-Lis CHAQUE ligne, CHAQUE bloc, CHAQUE mention de montant.
+Ton seul et unique rôle est de transformer une image de facture en un objet JSON STRICT respectant un schéma défini.
 
-Retourne UNIQUEMENT un objet JSON avec cette structure exacte :
+Tu ne dois JAMAIS :
+- Inventer une information absente de la facture
+- Ajouter du texte explicatif autour du JSON
+- Utiliser du markdown (pas de ```json, pas de ```)
+- Confondre un acompte avec une remise
+- Renvoyer un montant au format string si le schéma demande un number
 
+Tu dois TOUJOURS :
+- Convertir les montants français (1 234,56 €) en nombres décimaux (1234.56)
+- Convertir toutes les dates au format ISO YYYY-MM-DD
+- Mettre `null` pour toute information absente
+- Renvoyer un JSON syntaxiquement valide
+"""
+
+
+FEWSHOT_EXAMPLE = """<example>
+<facture_description>
+Une facture de l'entreprise "BATI-PRO SARL" (SIRET 12345678900012) émise le 15/03/2024,
+numéro F-2024-0142, adressée au client "Restaurant Le Bistrot" pour des travaux de ravalement.
+La facture comporte 2 lignes :
+- Ligne 1 : Ravalement façade nord, 80 m² à 45€/m² HT, TVA 10% (travaux rénovation)
+- Ligne 2 : Forfait nettoyage chantier, 1 forfait à 200€ HT, TVA 20%
+Un acompte de 1500€ a déjà été versé le 01/03/2024.
+Total HT = 3800€, TVA = 360€ (10%) + 40€ (20%) = 400€, TTC = 4200€, Net à payer = 2700€.
+</facture_description>
+
+<expected_json>
 {
-  "numero_facture": "string",
-  "date_emission": "YYYY-MM-DD",
-  "date_echeance": "YYYY-MM-DD ou null si absente",
-  "date_livraison": "YYYY-MM-DD ou null si absente",
-  "reference_commande": "string ou null",
-  "reference_devis": "string ou null",
-  "devise": "EUR / USD / GBP / etc.",
-  
+  "numero_facture": "F-2024-0142",
+  "date_emission": "2024-03-15",
+  "date_echeance": null,
+  "date_livraison": null,
+  "reference_commande": null,
+  "reference_devis": null,
+  "devise": "EUR",
   "fournisseur": {
-    "nom": "string",
-    "adresse": "string",
-    "siret": "string ou null",
-    "tva_intracom": "string ou null",
-    "iban": "string ou null",
-    "bic": "string ou null",
-    "telephone": "string ou null",
-    "email": "string ou null"
+    "nom": "BATI-PRO SARL",
+    "adresse": "12 rue des Artisans, 76600 Le Havre",
+    "siret": "12345678900012",
+    "tva_intracom": null,
+    "iban": null,
+    "bic": null,
+    "telephone": null,
+    "email": null
   },
-  
   "client": {
-    "nom": "string",
-    "contact": "string ou null (nom de la personne)",
-    "adresse": "string",
-    "siret": "string ou null",
-    "tva_intracom": "string ou null"
+    "nom": "Restaurant Le Bistrot",
+    "contact": null,
+    "adresse": "5 place Gambetta, 76600 Le Havre",
+    "siret": null,
+    "tva_intracom": null
   },
-  
   "lignes": [
     {
-      "reference": "string ou null",
-      "designation": "string",
-      "quantite": "string",
-      "unite": "string ou null (kg, m², h, forfait, etc.)",
+      "reference": null,
+      "designation": "Ravalement façade nord",
+      "quantite": 80,
+      "unite": "m²",
+      "prix_unitaire_ht": 45.00,
+      "remise_pourcentage": null,
+      "taux_tva": 10,
+      "total_ht": 3600.00
+    },
+    {
+      "reference": null,
+      "designation": "Forfait nettoyage chantier",
+      "quantite": 1,
+      "unite": "forfait",
+      "prix_unitaire_ht": 200.00,
+      "remise_pourcentage": null,
+      "taux_tva": 20,
+      "total_ht": 200.00
+    }
+  ],
+  "ventilation_tva": [
+    {"base_ht": 3600.00, "taux": 10, "montant_tva": 360.00},
+    {"base_ht": 200.00, "taux": 20, "montant_tva": 40.00}
+  ],
+  "totaux": {
+    "total_ht": 3800.00,
+    "total_tva": 400.00,
+    "total_ttc": 4200.00,
+    "acomptes_verses": [
+      {"date": "2024-03-01", "montant": 1500.00, "description": "Acompte versé à la commande"}
+    ],
+    "net_a_payer": 2700.00
+  },
+  "mode_paiement": "Virement bancaire",
+  "conditions_paiement": "30 jours fin de mois",
+  "informations_complementaires": {
+    "chantier": "Façade restaurant Le Bistrot",
+    "garanties": null,
+    "mentions_legales_specifiques": null,
+    "autres": null
+  }
+}
+</expected_json>
+</example>"""
+
+
+EXTRACTION_PROMPT = """Analyse l'image de facture ci-jointe et produis un JSON respectant exactement le schéma indiqué.
+
+<schema>
+{
+  "numero_facture": string,
+  "date_emission": "YYYY-MM-DD",
+  "date_echeance": "YYYY-MM-DD" | null,
+  "date_livraison": "YYYY-MM-DD" | null,
+  "reference_commande": string | null,
+  "reference_devis": string | null,
+  "devise": "EUR" | "USD" | "GBP" | autre code ISO,
+
+  "fournisseur": {
+    "nom": string,
+    "adresse": string,
+    "siret": string | null,
+    "tva_intracom": string | null,
+    "iban": string | null,
+    "bic": string | null,
+    "telephone": string | null,
+    "email": string | null
+  },
+
+  "client": {
+    "nom": string,
+    "contact": string | null,
+    "adresse": string,
+    "siret": string | null,
+    "tva_intracom": string | null
+  },
+
+  "lignes": [
+    {
+      "reference": string | null,
+      "designation": string,
+      "quantite": number,
+      "unite": string | null,
       "prix_unitaire_ht": number,
-      "remise_pourcentage": "number ou null",
-      "taux_tva": "number ou null",
+      "remise_pourcentage": number | null,
+      "taux_tva": number | null,
       "total_ht": number
     }
   ],
-  
+
   "ventilation_tva": [
-    {
-      "base_ht": number,
-      "taux": number,
-      "montant_tva": number
-    }
+    {"base_ht": number, "taux": number, "montant_tva": number}
   ],
-  
+
   "totaux": {
     "total_ht": number,
     "total_tva": number,
     "total_ttc": number,
     "acomptes_verses": [
-      {
-        "date": "YYYY-MM-DD ou null",
-        "montant": number,
-        "description": "string ou null"
-      }
+      {"date": "YYYY-MM-DD" | null, "montant": number, "description": string | null}
     ],
     "net_a_payer": number
   },
-  
-  "mode_paiement": "string ou null",
-  "conditions_paiement": "string ou null",
-  
+
+  "mode_paiement": string | null,
+  "conditions_paiement": string | null,
+
   "informations_complementaires": {
-    "chantier": "string ou null",
-    "garanties": "string ou null",
-    "mentions_legales_specifiques": "string ou null",
-    "autres": "string ou null (toute info importante non capturée ailleurs)"
+    "chantier": string | null,
+    "garanties": string | null,
+    "mentions_legales_specifiques": string | null,
+    "autres": string | null
   }
 }
+</schema>
 
-⚠️ RÈGLES STRICTES — À RESPECTER ABSOLUMENT :
+<rules>
+1. CAPTURE TOUTES les lignes du tableau, même sur plusieurs pages. Compte-les avant de produire le JSON.
+2. ACOMPTES : toute mention "acompte versé", "déjà payé", "déduction" va dans `acomptes_verses`. NE JAMAIS confondre avec une remise.
+3. REMISES : si une ligne a une remise (-5%, -10€), capture-la dans `remise_pourcentage` de la ligne.
+4. MULTI-TVA : un objet par taux distinct dans `ventilation_tva`.
+5. NET À PAYER : si mentionné explicitement et différent du TTC (à cause d'acomptes), capture-le. Sinon = total_ttc.
+6. DEVISE : code ISO (EUR, USD, GBP).
+7. DATES : format YYYY-MM-DD strict.
+8. MONTANTS : nombres décimaux uniquement. "1 234,56" devient 1234.56. JAMAIS de string pour un montant.
+9. ABSENT = null. Ne jamais inventer.
+10. Réponse = JSON pur uniquement. Aucun texte avant ou après. Aucun markdown.
+</rules>
 
-1. CAPTURE TOUTES LES LIGNES de la facture, même si le tableau s'étend sur plusieurs pages. Compte-les avant de répondre.
+<example_de_reference>
+Voici un exemple complet du format attendu pour une facture BTP type :
+""" + FEWSHOT_EXAMPLE + """
+</example_de_reference>
 
-2. ACOMPTES : si tu vois des mentions comme "acompte versé", "acompte reçu", "déjà payé", "déduction", tu DOIS les ajouter dans "acomptes_verses". Ne les confonds JAMAIS avec une remise.
+<verification_finale>
+Avant de produire ta réponse, vérifie mentalement :
+- As-tu capturé TOUTES les lignes ?
+- Tous les acomptes sont-ils dans `acomptes_verses` (pas dans les remises) ?
+- Les TVA sont-elles correctement ventilées par taux ?
+- Tous les montants sont-ils des nombres (pas des strings) ?
+- Total HT + Total TVA = Total TTC ? (si non, relis la facture)
+- Total TTC - somme(acomptes) = Net à payer ?
+</verification_finale>
 
-3. REMISES : si une ligne a une remise (-5%, -10€, "promo"), capture-la dans "remise_pourcentage" de la ligne concernée.
-
-4. MULTI-TVA : si la facture a plusieurs taux de TVA (5,5%, 10%, 20%), remplis "ventilation_tva" avec UN OBJET par taux différent.
-
-5. NET À PAYER : si la facture mentionne explicitement un "net à payer", "solde à régler", "à payer" différent du total TTC, capture-le. Sinon, mets la même valeur que total_ttc.
-
-6. DEVISE : détecte la devise (€, $, £, etc.) et utilise le code ISO (EUR, USD, GBP).
-
-7. FORMAT DATE : convertis TOUTES les dates au format YYYY-MM-DD, peu importe le format d'origine.
-
-8. MONTANTS : toujours des nombres (number), jamais des strings. Ignore les espaces et les virgules françaises (1 234,56 → 1234.56).
-
-9. NULL plutôt que invention : si une info n'est pas présente, mets null. NE JAMAIS inventer.
-
-10. PAS DE TEXTE autour du JSON. Pas de markdown, pas de commentaire. JUSTE le JSON pur.
-
-Avant de finaliser ta réponse, vérifie mentalement :
-✓ Ai-je capturé toutes les lignes du tableau ?
-✓ Ai-je détecté tous les acomptes éventuels ?
-✓ Ai-je correctement réparti les TVA si plusieurs taux ?
-✓ Mon JSON est-il valide et complet ?
+Produis maintenant le JSON, et UNIQUEMENT le JSON.
 """
+
 
 # ---------- HELPERS ----------
 
@@ -158,7 +261,7 @@ def pdf_to_images_base64(pdf_bytes: bytes, dpi: int = 150) -> list[str]:
     """Convertit un PDF en liste d'images PNG encodées en base64."""
     images_base64 = []
     pdf_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    
+
     for page in pdf_doc:
         zoom = dpi / 72
         matrix = fitz.Matrix(zoom, zoom)
@@ -166,7 +269,7 @@ def pdf_to_images_base64(pdf_bytes: bytes, dpi: int = 150) -> list[str]:
         img_bytes = pixmap.tobytes("png")
         img_base64 = base64.b64encode(img_bytes).decode("utf-8")
         images_base64.append(img_base64)
-    
+
     pdf_doc.close()
     return images_base64
 
@@ -174,38 +277,43 @@ def pdf_to_images_base64(pdf_bytes: bytes, dpi: int = 150) -> list[str]:
 def extract_invoice_data(pdf_bytes: bytes) -> dict:
     """
     Extrait les données structurées d'une facture PDF via l'API Mistral.
-    
+
     Args:
         pdf_bytes: Le contenu brut du PDF
-    
+
     Returns:
         dict: Les données extraites de la facture
-    
+
     Raises:
         Exception: Si l'extraction échoue
     """
     images_b64 = pdf_to_images_base64(pdf_bytes)
-    
-    content_parts = []
+
+    # Construction du message user : images + instruction
+    user_content = []
     for img_b64 in images_b64:
-        content_parts.append({
+        user_content.append({
             "type": "image_url",
             "image_url": f"data:image/png;base64,{img_b64}",
         })
-    content_parts.append({
+    user_content.append({
         "type": "text",
         "text": EXTRACTION_PROMPT,
     })
 
     response = client.chat.complete(
         model="pixtral-12b-latest",
-        messages=[{"role": "user", "content": content_parts}],
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
         response_format={"type": "json_object"},
+        temperature=0,
     )
 
     raw_text = response.choices[0].message.content.strip()
 
-    # Nettoyage des backticks markdown éventuels
+    # Nettoyage défensif des backticks markdown (ceinture + bretelles)
     if raw_text.startswith("```"):
         raw_text = raw_text.split("```")[1]
         if raw_text.startswith("json"):
@@ -218,7 +326,7 @@ def extract_invoice_data(pdf_bytes: bytes) -> dict:
 def invoice_to_excel(data: dict) -> bytes:
     """Convertit les données extraites en fichier Excel multi-feuilles (mode Single)."""
     output = BytesIO()
-    
+
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         infos = {
             "Champ": [
@@ -239,7 +347,7 @@ def invoice_to_excel(data: dict) -> bytes:
             ],
         }
         pd.DataFrame(infos).to_excel(writer, sheet_name="Infos", index=False)
-        
+
         fournisseur = data.get("fournisseur", {})
         df_fourn = pd.DataFrame({
             "Champ": ["Nom", "Adresse", "SIRET", "TVA Intracom", "IBAN", "BIC", "Téléphone", "Email"],
@@ -251,7 +359,7 @@ def invoice_to_excel(data: dict) -> bytes:
             ],
         })
         df_fourn.to_excel(writer, sheet_name="Fournisseur", index=False)
-        
+
         client_info = data.get("client", {})
         df_client = pd.DataFrame({
             "Champ": ["Nom", "Contact", "Adresse", "SIRET", "TVA Intracom"],
@@ -262,19 +370,19 @@ def invoice_to_excel(data: dict) -> bytes:
             ],
         })
         df_client.to_excel(writer, sheet_name="Client", index=False)
-        
+
         lignes = data.get("lignes", [])
         if lignes:
             pd.DataFrame(lignes).to_excel(writer, sheet_name="Lignes", index=False)
-        
+
         ventilation = data.get("ventilation_tva", [])
         if ventilation:
             pd.DataFrame(ventilation).to_excel(writer, sheet_name="Ventilation TVA", index=False)
-        
+
         acomptes = data.get("totaux", {}).get("acomptes_verses", [])
         if acomptes:
             pd.DataFrame(acomptes).to_excel(writer, sheet_name="Acomptes", index=False)
-        
+
         totaux = data.get("totaux", {})
         df_totaux = pd.DataFrame({
             "Champ": ["Total HT", "Total TVA", "Total TTC", "Net à payer"],
@@ -284,7 +392,7 @@ def invoice_to_excel(data: dict) -> bytes:
             ],
         })
         df_totaux.to_excel(writer, sheet_name="Totaux", index=False)
-    
+
     output.seek(0)
     return output.getvalue()
 
@@ -294,10 +402,10 @@ def invoice_to_csv(data: dict) -> str:
     fournisseur = data.get("fournisseur", {})
     client_info = data.get("client", {})
     totaux = data.get("totaux", {})
-    
+
     acomptes = totaux.get("acomptes_verses", [])
     total_acomptes = sum(a.get("montant", 0) for a in acomptes) if acomptes else 0
-    
+
     flat = {
         "numero_facture": data.get("numero_facture", ""),
         "date_emission": data.get("date_emission", ""),
@@ -316,7 +424,7 @@ def invoice_to_csv(data: dict) -> str:
         "iban": fournisseur.get("iban", ""),
         "mode_paiement": data.get("mode_paiement", ""),
     }
-    
+
     df = pd.DataFrame([flat])
     return df.to_csv(index=False, sep=';', encoding='utf-8-sig')
 
@@ -326,11 +434,11 @@ def invoice_to_flat_dict(data: dict, filename: str) -> dict:
     fournisseur = data.get("fournisseur", {})
     client_info = data.get("client", {})
     totaux = data.get("totaux", {})
-    
+
     acomptes = totaux.get("acomptes_verses", [])
     total_acomptes = sum(a.get("montant", 0) for a in acomptes) if acomptes else 0
     nb_lignes = len(data.get("lignes", []))
-    
+
     return {
         "fichier_source": filename,
         "numero_facture": data.get("numero_facture", ""),
@@ -356,18 +464,18 @@ def invoice_to_flat_dict(data: dict, filename: str) -> dict:
 def batch_to_excel(batch_results: list[dict], errors: list[dict]) -> bytes:
     """Génère un fichier Excel consolidé pour le batch."""
     output = BytesIO()
-    
+
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         # Feuille 1 : Récapitulatif (1 ligne par facture)
         if batch_results:
             df_recap = pd.DataFrame(batch_results)
             df_recap.to_excel(writer, sheet_name="Récapitulatif", index=False)
-        
+
         # Feuille 2 : Erreurs (s'il y en a)
         if errors:
             df_errors = pd.DataFrame(errors)
             df_errors.to_excel(writer, sheet_name="Erreurs", index=False)
-        
+
         # Feuille 3 : Statistiques globales
         if batch_results:
             df_results = pd.DataFrame(batch_results)
@@ -396,7 +504,7 @@ def batch_to_excel(batch_results: list[dict], errors: list[dict]) -> bytes:
                 ],
             }
             pd.DataFrame(stats_data).to_excel(writer, sheet_name="Statistiques", index=False)
-    
+
     output.seek(0)
     return output.getvalue()
 
@@ -425,7 +533,7 @@ mode = st.radio(
 st.divider()
 
 # ============================================================
-# MODE SINGLE — Une facture à la fois (existant)
+# MODE SINGLE — Une facture à la fois
 # ============================================================
 
 if mode == "📄 Single (1 facture)":
@@ -575,11 +683,11 @@ if mode == "📄 Single (1 facture)":
 
 
 # ============================================================
-# MODE BATCH — Plusieurs factures consolidées (NOUVEAU)
+# MODE BATCH — Plusieurs factures consolidées
 # ============================================================
 
 else:  # mode == "📚 Batch (plusieurs factures)"
-    
+
     st.markdown("""
     📚 **Mode Batch** : uploadez plusieurs factures PDF en une seule fois.
     L'IA traite chaque facture et vous obtenez :
@@ -587,7 +695,7 @@ else:  # mode == "📚 Batch (plusieurs factures)"
     - Un fichier Excel consolidé prêt pour la compta
     - Statistiques globales (totaux cumulés, moyennes, etc.)
     """)
-    
+
     uploaded_files = st.file_uploader(
         "Choisissez plusieurs factures PDF",
         type=["pdf"],
@@ -597,23 +705,23 @@ else:  # mode == "📚 Batch (plusieurs factures)"
 
     if uploaded_files:
         st.success(f"✅ **{len(uploaded_files)} fichier(s)** prêts à traiter")
-        
+
         # Affichage de la liste des fichiers
         with st.expander(f"📋 Voir la liste des {len(uploaded_files)} fichier(s)"):
             for i, f in enumerate(uploaded_files, 1):
                 st.write(f"{i}. {f.name} ({f.size / 1024:.1f} KB)")
-        
+
         # Bouton lancement traitement
         if st.button("🚀 Lancer le traitement batch", type="primary"):
-            
+
             # Initialisation des conteneurs de résultats
             batch_results = []
             errors = []
-            
+
             # Barre de progression et zone de status
             progress_bar = st.progress(0, text="Préparation...")
             status_container = st.container()
-            
+
             # Traitement de chaque facture
             for i, uploaded_file in enumerate(uploaded_files):
                 progress = (i + 1) / len(uploaded_files)
@@ -621,25 +729,25 @@ else:  # mode == "📚 Batch (plusieurs factures)"
                     progress,
                     text=f"📄 Traitement {i+1}/{len(uploaded_files)} : {uploaded_file.name}"
                 )
-                
+
                 try:
                     # Lecture du fichier
                     pdf_bytes = uploaded_file.read()
-                    
+
                     # Extraction
                     data = extract_invoice_data(pdf_bytes)
-                    
+
                     # Aplatissement pour la consolidation
                     flat = invoice_to_flat_dict(data, uploaded_file.name)
                     batch_results.append(flat)
-                    
+
                     with status_container:
                         st.success(
                             f"✅ {uploaded_file.name} → "
                             f"Facture {flat['numero_facture']} - "
                             f"{flat['total_ttc']:,.2f} {flat['devise']}"
                         )
-                
+
                 except Exception as e:
                     errors.append({
                         "fichier": uploaded_file.name,
@@ -647,21 +755,21 @@ else:  # mode == "📚 Batch (plusieurs factures)"
                     })
                     with status_container:
                         st.error(f"❌ {uploaded_file.name} → Erreur : {str(e)[:100]}")
-            
+
             progress_bar.progress(1.0, text="✅ Traitement terminé !")
-            
+
             # Stockage en session pour réafficher
             st.session_state["batch_results"] = batch_results
             st.session_state["batch_errors"] = errors
-    
+
     # Affichage des résultats batch
     if "batch_results" in st.session_state and st.session_state["batch_results"]:
         st.divider()
         st.subheader("📊 Résultats du traitement batch")
-        
+
         results = st.session_state["batch_results"]
         errors = st.session_state.get("batch_errors", [])
-        
+
         # KPIs globaux
         df_results = pd.DataFrame(results)
         kpi_cols = st.columns(4)
@@ -673,20 +781,20 @@ else:  # mode == "📚 Batch (plusieurs factures)"
             st.metric("💰 Total HT", f"{df_results['total_ht'].sum():,.2f} €")
         with kpi_cols[3]:
             st.metric("💵 Total TTC", f"{df_results['total_ttc'].sum():,.2f} €")
-        
+
         # Tableau récapitulatif
         st.markdown("### 📋 Tableau récapitulatif")
         st.dataframe(df_results, use_container_width=True)
-        
+
         # Tableau erreurs s'il y en a
         if errors:
             st.markdown("### ⚠️ Factures en erreur")
             st.dataframe(pd.DataFrame(errors), use_container_width=True)
-        
+
         # Boutons d'export
         st.markdown("### 💾 Export consolidé")
         export_cols = st.columns(2)
-        
+
         with export_cols[0]:
             excel_bytes = batch_to_excel(results, errors)
             st.download_button(
@@ -697,7 +805,7 @@ else:  # mode == "📚 Batch (plusieurs factures)"
                 use_container_width=True,
                 type="primary",
             )
-        
+
         with export_cols[1]:
             csv_str = df_results.to_csv(index=False, sep=';', encoding='utf-8-sig')
             st.download_button(
